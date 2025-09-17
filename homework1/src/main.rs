@@ -24,7 +24,7 @@ fn assignment1() {
 }
 
 fn is_even(n: i32) -> bool {
-    n & 1 != 0
+    n & 1 == 0
 }
 
 fn assignment2() {
