@@ -4,22 +4,31 @@ fn farenheight_to_celsius(farenheight: f64) -> f64 {
     (farenheight - FREEZING_POINT_FARENHEIGHT) * 5.0 / 9.0
 }
 
-// Hey, the AI generated assignment forgot to include the usage of this function!
-#[allow(dead_code)]
 fn celsius_to_farenheight(celsius: f64) -> f64 {
     (celsius * 9.0 / 5.0) + FREEZING_POINT_FARENHEIGHT
 }
 
 fn assignment1() {
-    let mut farenheight = 100.0;
+    {
+        let mut farenheight = 100.0;
 
-    for i in 0..=5 {
-        farenheight += i as f64;
+        for i in 0..=5 {
+            farenheight += i as f64;
 
-        println!(
-            "{farenheight}°F is {:.2}°C",
-            farenheight_to_celsius(farenheight)
-        );
+            println!(
+                "{farenheight}°F is {:.2}°C",
+                farenheight_to_celsius(farenheight)
+            );
+        }
+    }
+    {
+        let mut celsius = 24.0;
+
+        for i in 0..=5 {
+            celsius += i as f64;
+
+            println!("{celsius}°C is {:.2}°F", celsius_to_farenheight(celsius));
+        }
     }
 }
 
