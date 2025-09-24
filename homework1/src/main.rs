@@ -109,6 +109,7 @@ fn assignment3() {
         }
 
         count += 1;
+        input.clear();
     }
 
     println!("You guessed it in {count} tries!");
