@@ -4,6 +4,13 @@ use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use std::collections::VecDeque;
+
+/// This is the meat and potatoes of the work Queue. The atomic ring buffer allows us to safely
+/// enqueue, dequeue, and steal work safely across threads.
+/// https://zig.news/kprotty/resource-efficient-thread-pools-with-zig-3291
+/// This was based on some of that King Protty has done a while back for the Zig Programming
+/// Language.
 pub struct AtomicRingBuffer<T, const N: usize> {
     buff: [UnsafeCell<MaybeUninit<T>>; N],
     head: AtomicU32,
@@ -11,6 +18,7 @@ pub struct AtomicRingBuffer<T, const N: usize> {
 }
 
 impl<T, const N: usize> AtomicRingBuffer<T, N> {
+    /// Creates a new AtomicRingBuffer.
     pub fn new() -> Self {
         Self {
             // SAFETY:
@@ -25,13 +33,15 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
         }
     }
 
-    pub fn size(&self) -> u32 {
+    /// Returns the number of currently allocated elements in the buffer.
+    pub fn len(&self) -> u32 {
         let head = self.head.load(Ordering::Acquire);
         let tail = self.tail.load(Ordering::Acquire);
 
         tail.wrapping_sub(head)
     }
 
+    /// Returns true if there are no elements in the buffer.
     pub fn is_empty(&self) -> bool {
         let head = self.head.load(Ordering::Acquire);
         let tail = self.tail.load(Ordering::Acquire);
@@ -39,6 +49,10 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
         head == tail
     }
 
+    /// Pushes an element to the buffer.
+    // TODO: push can fail and a viable solution is to spin until it succeeds. However, push
+    // requires ownership over the pushed element. Upon failure, this element will not be pushed to
+    // the Queue and dropped.
     pub fn push(&self, elem: T) -> bool {
         // SAFETY: We don't need to worry about other threads that have acquired the tail via
         // `Self::pop` and `Self::steal`. We only check to see if the queue if full. Removing
@@ -61,6 +75,7 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
         true
     }
 
+    /// Removes an element from the buffer.
     pub fn pop(&self) -> Option<T> {
         loop {
             // SAFETY: We don't need to worry about other threads that have acquired the tail via
@@ -94,7 +109,8 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
         }
     }
 
-    pub fn steal(&self, dest: &mut Vec<T>) -> bool {
+    /// Moves ownership of multiple elements in the buffer to the destination at once.
+    pub fn steal(&self, dest: &mut VecDeque<T>) -> bool {
         loop {
             let head = self.head.load(Ordering::Acquire);
             let tail = self.tail.load(Ordering::Acquire);
@@ -130,7 +146,7 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
                     // this point we have guaranteed that there is an initialized element to pop and we
                     // are preventing another thread from having access to the slot.
                     let elem = unsafe { core::ptr::read((*slot.get()).as_ptr()) };
-                    dest.push(elem);
+                    dest.push_back(elem);
                 }
 
                 return true;
@@ -150,7 +166,19 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
 
 impl<T, const N: usize> Drop for AtomicRingBuffer<T, N> {
     fn drop(&mut self) {
-        // If we have elements left in the buffer they don't get dropped which is very bad.
-        assert!(self.is_empty());
+        let head = *self.head.get_mut() as usize;
+        let tail = *self.tail.get_mut() as usize;
+
+        for i in head..tail {
+            let slot = self.buff[i].get() as *mut T;
+            // SAFETY: We have exclusive access to the ring buffer. This operation is completely
+            // safe unless I've screwed up the head/tail indexing.
+            unsafe { core::ptr::drop_in_place(slot) };
+        }
     }
 }
+
+// SAFETY: AtomicRingBuffer is implemented on top of Atomic Operations and will not leak its
+// internal data.
+unsafe impl<T: Send, const N: usize> Send for AtomicRingBuffer<T, N> {}
+unsafe impl<T: Send, const N: usize> Sync for AtomicRingBuffer<T, N> {}
