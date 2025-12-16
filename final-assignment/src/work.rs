@@ -1,44 +1,55 @@
 use std::collections::VecDeque;
+use std::num::NonZero;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::Instant;
 
-use crate::ring::AtomicRingBuffer;
+use crate::ring::AtomicRingQueue;
 
 /// Spawns, synchronizes, and schedules Tasks for Workers to execute.
 pub struct Queue {
-    work: AtomicRingBuffer<Task, 1024>,
+    work: AtomicRingQueue<Task, 1024>,
     waker: Waker,
     sync: Sync,
 
     total_tasks: AtomicUsize,
     total_error: AtomicUsize,
+
+    config: Config,
 }
 
 impl Queue {
+    pub fn builder() -> Config {
+        Config::default()
+    }
+
     /// Creates a new Queue.
-    pub fn new() -> Self {
+    pub fn new(config: Config) -> Self {
         Self {
-            work: AtomicRingBuffer::new(),
+            work: AtomicRingQueue::new(),
             waker: Waker::new(),
             sync: Sync::new(),
 
             total_tasks: 0.into(),
             total_error: 0.into(),
+
+            config,
         }
     }
 
     /// Schedules a task to be executed and will spawn a new worker or wake an existing worker to
     /// execute it.
     pub fn spawn(&self, task: impl Into<Task>) {
-        let success = self.work.push(task.into());
-        debug_assert!(success, "work queue full");
+        let mut task = task.into();
+        while let Err(t) = self.work.enqueue(task) {
+            task = t;
+        }
 
         self.total_tasks.fetch_add(1, Ordering::Relaxed);
 
-        if self.sync.get_spawned() < 12 {
+        if self.sync.get_spawned() <= self.config.max_workers {
             Worker::spawn(self);
         } else {
             self.waker.wake_one();
@@ -67,7 +78,7 @@ impl Queue {
 
         self.sync.toggle_join();
 
-        debug_assert!(self.work.is_empty());
+        assert!(self.work.is_empty());
     }
 
     /// Returns metrics about the Queue.
@@ -86,13 +97,47 @@ impl Queue {
 
 impl Default for Queue {
     fn default() -> Self {
-        Self::new()
+        Self::new(Config::default())
     }
 }
 
 impl Drop for Queue {
     fn drop(&mut self) {
         self.wait();
+    }
+}
+
+pub struct Config {
+    max_workers: u16,
+    local_queue_capacity: usize,
+}
+
+impl Config {
+    pub fn max_workers(mut self, max_workers: u16) -> Self {
+        self.max_workers = max_workers;
+        self
+    }
+
+    pub fn local_queue_capacity(mut self, local_queue_capacity: usize) -> Self {
+        self.local_queue_capacity = local_queue_capacity;
+        self
+    }
+
+    pub fn build(self) -> Queue {
+        Queue::new(self)
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        let max_workers = thread::available_parallelism()
+            .unwrap_or(unsafe { NonZero::new_unchecked(1) })
+            .get() as u16;
+
+        Self {
+            max_workers,
+            local_queue_capacity: 256,
+        }
     }
 }
 
@@ -110,7 +155,7 @@ impl Scope {
             Priority::Realtime => worker.work.push_front(task),
             Priority::Default => worker.work.push_back(task),
             Priority::Background => {
-                worker.queue.work.push(task);
+                worker.queue.work.enqueue(task);
             }
         };
 
@@ -135,6 +180,7 @@ impl Scope {
 }
 
 /// Implements priority in which tasks can be scheduled within a worker.
+#[derive(PartialOrd, PartialEq, Ord, Eq)]
 pub enum Priority {
     Realtime,
     Default,
@@ -202,7 +248,7 @@ impl Worker {
         }
 
         // Attempt to execute more tasks from the global work queue if there is any left.
-        while let Some(task) = self.queue.work.pop() {
+        while let Some(task) = self.queue.work.dequeue() {
             self.execute(task);
         }
     }
@@ -220,7 +266,7 @@ impl Worker {
     /// Creates a new Worker.
     fn new(queue: &'static Queue) -> Self {
         Self {
-            work: VecDeque::with_capacity(256),
+            work: VecDeque::with_capacity(queue.config.local_queue_capacity),
             queue,
         }
     }
@@ -352,6 +398,134 @@ impl Waker {
 
         while *seq == current {
             seq = self.0.wait(seq).unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    /// This shows the basic implementation of the work queue where multiple threads all operate on
+    /// the same atomic counter across threads. Workers are dynamically allocated and we gracefully
+    /// shutdown with the `Queue::wait()` function along with the `Queue::drop()` implementation
+    /// where we can wait for all workers to finish executing.
+    #[test]
+    fn test_work_queue_counter() {
+        let mut count = Arc::new(AtomicUsize::new(0));
+        let mut queue = Queue::default();
+
+        for _ in 0..10 {
+            let count = count.clone();
+            queue.spawn(move |_scope: Scope| {
+                count.fetch_add(1, Ordering::AcqRel);
+            });
+        }
+
+        queue.wait();
+
+        assert_eq!(count.load(Ordering::Acquire), 10);
+    }
+
+    /// This tests showcases the priority scheduling that individual workers have. There are 3
+    /// priority levels: Realtime, Default, and Background. Realtime tasks are pushed to the front
+    /// of the local work queue, workers will execute realtime tasks over default and background
+    /// tasks. Default tasks are pushed to the back of the local work queue. Default tasks are
+    /// executed after realtime tasks. Finally background tasks are pushed to the global work queue
+    /// for any Workers to steal when looking for work to do.
+    #[test]
+    fn test_work_queue_priority_scheduling() {
+        let execution_order = Arc::new(Mutex::new(Vec::new()));
+        let mut queue = Queue::builder().max_workers(1).build();
+
+        queue.spawn({
+            let execution_order = execution_order.clone();
+            move |scope: Scope| {
+                scope.schedule(Priority::Background, {
+                    let execution_order = execution_order.clone();
+                    move |_scope: Scope| {
+                        execution_order.lock().unwrap().push(Priority::Background);
+                    }
+                });
+
+                for _ in 0..5 {
+                    let execution_order = execution_order.clone();
+                    scope.schedule(Priority::Default, move |_scope: Scope| {
+                        execution_order.lock().unwrap().push(Priority::Default);
+                    });
+                }
+
+                scope.schedule(Priority::Realtime, {
+                    let execution_order = execution_order.clone();
+                    move |_scope: Scope| {
+                        execution_order.lock().unwrap().push(Priority::Realtime);
+                    }
+                });
+            }
+        });
+
+        queue.wait();
+
+        let order = execution_order.lock().unwrap();
+
+        let realtime_pos = order.iter().position(|x| x == &Priority::Realtime).unwrap();
+        let first_default = order.iter().position(|x| x == &Priority::Default).unwrap();
+        let background_pos = order
+            .iter()
+            .position(|x| x == &Priority::Background)
+            .unwrap();
+
+        assert!(realtime_pos < first_default);
+        assert!(first_default < background_pos);
+    }
+
+    /// This test shows a couple of features. We can gracefully handle panics while continuing to
+    /// use the same worker and being able to keep track of the total number of tasks that get
+    /// executed and the total number of errors that occur.
+    #[test]
+    fn test_work_queue_handle_panic() {
+        let mut queue = Queue::default();
+
+        queue.spawn(move |scope: Scope| {
+            for i in 0..10 {
+                scope.schedule(Default::default(), move |_scope: Scope| {
+                    // Chaos testing.
+                    if i & 1 == 0 {
+                        panic!("{i} did not pass the vibe check");
+                    }
+                });
+            }
+        });
+
+        queue.wait();
+
+        let Metrics {
+            total_tasks,
+            total_error,
+            ..
+        } = queue.metrics();
+
+        assert_eq!(total_tasks, 11);
+        assert_eq!(total_error, 5);
+    }
+
+    /// Idk, this is some relatively high load. Over 10000 tasks. All of them get executed.
+    #[test]
+    fn test_work_queue_high_load() {
+        let mut queue = Queue::default();
+
+        for _ in 0..5000 {
+            queue.spawn(|scope: Scope| {
+                thread::sleep(Duration::from_millis(1));
+
+                scope.schedule(Priority::Background, |_scope: Scope| {
+                    thread::sleep(Duration::from_millis(1));
+                });
+            });
         }
     }
 }

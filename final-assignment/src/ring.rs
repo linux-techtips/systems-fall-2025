@@ -8,18 +8,19 @@ use std::collections::VecDeque;
 
 /// This is the meat and potatoes of the work Queue. The atomic ring buffer allows us to safely
 /// enqueue, dequeue, and steal work safely across threads.
-/// https://zig.news/kprotty/resource-efficient-thread-pools-with-zig-3291
 /// This was based on some of that King Protty has done a while back for the Zig Programming
-/// Language.
-pub struct AtomicRingBuffer<T, const N: usize> {
+/// Language. <https://zig.news/kprotty/resource-efficient-thread-pools-with-zig-3291>
+pub struct AtomicRingQueue<T, const N: usize> {
     buff: [UnsafeCell<MaybeUninit<T>>; N],
     head: AtomicU32,
     tail: AtomicU32,
 }
 
-impl<T, const N: usize> AtomicRingBuffer<T, N> {
-    /// Creates a new AtomicRingBuffer.
+impl<T, const N: usize> AtomicRingQueue<T, N> {
+    /// Creates a new AtomicRingQueue.
     pub fn new() -> Self {
+        Self::ASSERT_SIZE_POW2;
+
         Self {
             // SAFETY:
             //  See `Self::push` and `Self::pop`: Elements will not be read before they are
@@ -41,6 +42,11 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
         tail.wrapping_sub(head)
     }
 
+    /// Returns the capacity of the queue.
+    pub fn capacity(&self) -> usize {
+        N
+    }
+
     /// Returns true if there are no elements in the buffer.
     pub fn is_empty(&self) -> bool {
         let head = self.head.load(Ordering::Acquire);
@@ -50,10 +56,7 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
     }
 
     /// Pushes an element to the buffer.
-    // TODO: push can fail and a viable solution is to spin until it succeeds. However, push
-    // requires ownership over the pushed element. Upon failure, this element will not be pushed to
-    // the Queue and dropped.
-    pub fn push(&self, elem: T) -> bool {
+    pub fn enqueue(&self, elem: T) -> Result<(), T> {
         // SAFETY: We don't need to worry about other threads that have acquired the tail via
         // `Self::pop` and `Self::steal`. We only check to see if the queue if full. Removing
         // elements from the queue would only cause potential failures to succeed.
@@ -61,7 +64,7 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
         let head = self.head.load(Ordering::Acquire);
 
         if tail.wrapping_sub(head) as usize >= self.buff.len() {
-            return false;
+            return Err(elem);
         }
 
         let slot = &self.buff[tail as usize & (self.buff.len() - 1)];
@@ -72,11 +75,11 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
 
         self.tail.store(tail.wrapping_add(1), Ordering::Release);
 
-        true
+        Ok(())
     }
 
     /// Removes an element from the buffer.
-    pub fn pop(&self) -> Option<T> {
+    pub fn dequeue(&self) -> Option<T> {
         loop {
             // SAFETY: We don't need to worry about other threads that have acquired the tail via
             // `Self::pop` and `Self::steal`. We only check to see if the queue if full. Removing
@@ -160,11 +163,10 @@ impl<T, const N: usize> AtomicRingBuffer<T, N> {
     // two. This allows us to replace modulo in ring operations like: head % buff.len() into head &
     // (buff.len() - 1) which is much faster.
     #[doc(hidden)]
-    #[allow(dead_code)]
     const ASSERT_SIZE_POW2: () = const { assert!(N & (N - 1) == 0) };
 }
 
-impl<T, const N: usize> Drop for AtomicRingBuffer<T, N> {
+impl<T, const N: usize> Drop for AtomicRingQueue<T, N> {
     fn drop(&mut self) {
         let head = *self.head.get_mut() as usize;
         let tail = *self.tail.get_mut() as usize;
@@ -178,7 +180,117 @@ impl<T, const N: usize> Drop for AtomicRingBuffer<T, N> {
     }
 }
 
-// SAFETY: AtomicRingBuffer is implemented on top of Atomic Operations and will not leak its
+// SAFETY: AtomicRingQueue is implemented on top of Atomic Operations and will not leak its
 // internal data.
-unsafe impl<T: Send, const N: usize> Send for AtomicRingBuffer<T, N> {}
-unsafe impl<T: Send, const N: usize> Sync for AtomicRingBuffer<T, N> {}
+unsafe impl<T: Send, const N: usize> Send for AtomicRingQueue<T, N> {}
+unsafe impl<T: Send, const N: usize> Sync for AtomicRingQueue<T, N> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::collections::VecDeque;
+    use std::thread;
+
+    #[test]
+    fn test_threaded_ring_enqueue() {
+        let mut queue = AtomicRingQueue::<u32, 2>::new();
+
+        thread::scope(|scope| {
+            scope.spawn(|| queue.enqueue(34));
+            scope.spawn(|| queue.enqueue(35));
+        });
+
+        let Some(lhs) = queue.dequeue() else {
+            unreachable!("failed to dequeue element")
+        };
+
+        let Some(rhs) = queue.dequeue() else {
+            unreachable!("failed to dequeue element")
+        };
+
+        assert_eq!(lhs + rhs, 69);
+    }
+
+    #[test]
+    fn test_threaded_ring_dequeue() {
+        let mut queue = AtomicRingQueue::<u32, 4>::new();
+        let mut count = AtomicU32::new(0);
+
+        queue.enqueue(1);
+        queue.enqueue(2);
+        queue.enqueue(3);
+        queue.enqueue(4);
+
+        thread::scope(|scope| {
+            let work = || {
+                while let Some(elem) = queue.dequeue() {
+                    count.fetch_add(elem, Ordering::AcqRel);
+                }
+            };
+
+            scope.spawn(work);
+            scope.spawn(work);
+        });
+
+        assert_eq!(count.load(Ordering::Acquire), 10);
+    }
+
+    #[test]
+    fn test_threaded_ring_steal() {
+        let mut queue = AtomicRingQueue::<u32, 128>::new();
+        let mut count = AtomicU32::new(0);
+
+        for i in 0..queue.capacity() {
+            queue.enqueue(1);
+        }
+
+        thread::scope(|scope| {
+            let work = || {
+                let mut deque = VecDeque::new();
+
+                while queue.steal(&mut deque) {}
+
+                count.fetch_add(deque.iter().sum(), Ordering::AcqRel);
+            };
+
+            scope.spawn(work);
+            scope.spawn(work);
+        });
+
+        assert_eq!(count.load(Ordering::Acquire), 128);
+    }
+
+    static mut DROP_COUNTER: u32 = 0;
+
+    struct DropCounter(u32);
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            // SAFETY: The drop implementation is only used for testing and will not be used across
+            // threads.
+            unsafe { DROP_COUNTER += self.0 };
+        }
+    }
+
+    #[test]
+    fn test_ring_drop() {
+        let mut queue = AtomicRingQueue::<DropCounter, 4>::new();
+
+        queue.enqueue(DropCounter(67));
+        queue.enqueue(DropCounter(35));
+        queue.enqueue(DropCounter(34));
+
+        if let Some(counter) = queue.dequeue() {
+            // Only run drop on elements currently owned by the queue.
+            core::mem::forget(counter);
+        } else {
+            unreachable!("failed to pop from queue");
+        };
+
+        drop(queue);
+
+        // SAFETY: See `DropCounter::drop`.
+        assert_eq!(unsafe { DROP_COUNTER }, 69);
+    }
+}
