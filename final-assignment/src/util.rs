@@ -8,6 +8,7 @@ pub(crate) trait UncheckedAtomics {
         unsafe { core::ptr::read(self as *const Self as *const Self::Target) }
     }
 
+    #[allow(dead_code)]
     unsafe fn store_unchecked(&self, value: Self::Target) {
         // SAFETY: There is no such thing as atomic data, just atomic operations.
         // Under the hood, data types like AtomicU32 are just u32 with a wrapper that only allows

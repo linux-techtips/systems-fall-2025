@@ -19,6 +19,7 @@ pub struct AtomicRingQueue<T, const N: usize> {
 impl<T, const N: usize> AtomicRingQueue<T, N> {
     /// Creates a new AtomicRingQueue.
     pub fn new() -> Self {
+        #[allow(path_statements)]
         Self::ASSERT_SIZE_POW2;
 
         Self {
@@ -43,6 +44,7 @@ impl<T, const N: usize> AtomicRingQueue<T, N> {
     }
 
     /// Returns the capacity of the queue.
+    #[allow(dead_code)]
     pub fn capacity(&self) -> usize {
         N
     }
@@ -166,6 +168,12 @@ impl<T, const N: usize> AtomicRingQueue<T, N> {
     const ASSERT_SIZE_POW2: () = const { assert!(N & (N - 1) == 0) };
 }
 
+impl<T, const N: usize> Default for AtomicRingQueue<T, N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T, const N: usize> Drop for AtomicRingQueue<T, N> {
     fn drop(&mut self) {
         let head = *self.head.get_mut() as usize;
@@ -194,7 +202,7 @@ mod tests {
 
     #[test]
     fn test_threaded_ring_enqueue() {
-        let mut queue = AtomicRingQueue::<u32, 2>::new();
+        let queue = AtomicRingQueue::<u32, 2>::new();
 
         thread::scope(|scope| {
             scope.spawn(|| queue.enqueue(34));
@@ -214,13 +222,13 @@ mod tests {
 
     #[test]
     fn test_threaded_ring_dequeue() {
-        let mut queue = AtomicRingQueue::<u32, 4>::new();
-        let mut count = AtomicU32::new(0);
+        let queue = AtomicRingQueue::<u32, 4>::new();
+        let count = AtomicU32::new(0);
 
-        queue.enqueue(1);
-        queue.enqueue(2);
-        queue.enqueue(3);
-        queue.enqueue(4);
+        queue.enqueue(1).unwrap();
+        queue.enqueue(2).unwrap();
+        queue.enqueue(3).unwrap();
+        queue.enqueue(4).unwrap();
 
         thread::scope(|scope| {
             let work = || {
@@ -238,11 +246,11 @@ mod tests {
 
     #[test]
     fn test_threaded_ring_steal() {
-        let mut queue = AtomicRingQueue::<u32, 128>::new();
-        let mut count = AtomicU32::new(0);
+        let queue = AtomicRingQueue::<u32, 128>::new();
+        let count = AtomicU32::new(0);
 
-        for i in 0..queue.capacity() {
-            queue.enqueue(1);
+        for _ in 0..queue.capacity() {
+            queue.enqueue(1).unwrap();
         }
 
         thread::scope(|scope| {
@@ -263,23 +271,24 @@ mod tests {
 
     static mut DROP_COUNTER: u32 = 0;
 
-    struct DropCounter(u32);
-
-    impl Drop for DropCounter {
-        fn drop(&mut self) {
-            // SAFETY: The drop implementation is only used for testing and will not be used across
-            // threads.
-            unsafe { DROP_COUNTER += self.0 };
-        }
-    }
-
     #[test]
     fn test_ring_drop() {
-        let mut queue = AtomicRingQueue::<DropCounter, 4>::new();
+        #[derive(Debug)]
+        struct DropCounter(u32);
 
-        queue.enqueue(DropCounter(67));
-        queue.enqueue(DropCounter(35));
-        queue.enqueue(DropCounter(34));
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                // SAFETY: The drop implementation is only used for testing and will not be used across
+                // threads.
+                unsafe { DROP_COUNTER += self.0 };
+            }
+        }
+
+        let queue = AtomicRingQueue::<DropCounter, 4>::new();
+
+        queue.enqueue(DropCounter(67)).unwrap();
+        queue.enqueue(DropCounter(35)).unwrap();
+        queue.enqueue(DropCounter(34)).unwrap();
 
         if let Some(counter) = queue.dequeue() {
             // Only run drop on elements currently owned by the queue.

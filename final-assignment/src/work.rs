@@ -45,6 +45,7 @@ impl Queue {
         let mut task = task.into();
         while let Err(t) = self.work.enqueue(task) {
             task = t;
+            thread::yield_now();
         }
 
         self.total_tasks.fetch_add(1, Ordering::Relaxed);
@@ -58,12 +59,12 @@ impl Queue {
 
     /// Waits for all currently scheduled tasks to be executed to completion.
     pub fn wait(&mut self) {
+        self.sync.toggle_join();
+
         while !self.sync.all_idle() {
             // TODO: A barrier or something rather than a thread spin loop.
             thread::yield_now();
         }
-
-        self.sync.toggle_join();
 
         loop {
             self.waker.wake_all();
@@ -155,7 +156,9 @@ impl Scope {
             Priority::Realtime => worker.work.push_front(task),
             Priority::Default => worker.work.push_back(task),
             Priority::Background => {
-                worker.queue.work.enqueue(task);
+                if let Err(task) = worker.queue.work.enqueue(task) {
+                    worker.work.push_back(task);
+                }
             }
         };
 
@@ -202,10 +205,6 @@ struct Worker {
 impl Worker {
     /// Spawnd a worker from the context of a Queue.
     fn spawn(queue: &Queue) {
-        if queue.sync.get_joining() {
-            return;
-        }
-
         queue.sync.inc_spawned();
 
         let queue = queue as *const Queue as usize;
@@ -284,6 +283,14 @@ where
 {
     fn from(value: F) -> Self {
         Self(Box::new(value))
+    }
+}
+
+impl std::fmt::Debug for Task {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Task")
+            .field(&format!("{:p}", self.0.as_ref()))
+            .finish()
     }
 }
 
@@ -406,7 +413,7 @@ impl Waker {
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
+    use std::sync::{Arc, mpsc};
     use std::thread;
     use std::time::Duration;
 
@@ -416,7 +423,7 @@ mod tests {
     /// where we can wait for all workers to finish executing.
     #[test]
     fn test_work_queue_counter() {
-        let mut count = Arc::new(AtomicUsize::new(0));
+        let count = Arc::new(AtomicUsize::new(0));
         let mut queue = Queue::default();
 
         for _ in 0..10 {
@@ -513,10 +520,33 @@ mod tests {
         assert_eq!(total_error, 5);
     }
 
+    // This test shows off how long running tasks can be cancelled cooperatively with the task
+    // scope. It is one of the ways I use atomic operations to coordinate the separate workers.
+    #[test]
+    fn test_work_queue_task_cancellation() {
+        let (tx, rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let mut queue = Queue::default();
+
+            queue.spawn(|scope: Scope| {
+                while !scope.is_shutdown() {
+                    core::hint::spin_loop();
+                }
+            });
+
+            queue.wait();
+            tx.send(()).unwrap();
+        });
+
+        rx.recv_timeout(Duration::from_millis(100))
+            .expect("test timed out - queue.wait() hung");
+    }
+
     /// Idk, this is some relatively high load. Over 10000 tasks. All of them get executed.
     #[test]
     fn test_work_queue_high_load() {
-        let mut queue = Queue::default();
+        let queue = Queue::default();
 
         for _ in 0..5000 {
             queue.spawn(|scope: Scope| {
@@ -527,5 +557,16 @@ mod tests {
                 });
             });
         }
+    }
+
+    /// Asserts that the Queue memory usage is under 10GB.
+    /// This is not entirely accurate. This is just the memory overhead for maintaining a Queue.
+    /// There are still separate allocations that occur within the context of an individual worker.
+    /// The total memory usage of the Queue is ~16kb and each Task typically weighs in at about 16
+    /// bytes. If we had a definition for "extreme load" and how many tasks and what the tasks are
+    /// doing then I can come up with a better metric for you.
+    #[test]
+    fn test_work_queue_memory_usage() {
+        assert!(core::mem::size_of::<Queue>() <= (1024 * 1024 * 1024))
     }
 }
